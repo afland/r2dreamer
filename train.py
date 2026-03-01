@@ -42,6 +42,20 @@ def main(config):
     train_envs, eval_envs, obs_space, act_space = make_envs(config.env)
 
     print("Simulate agent.")
+    print(f"  rep_loss: {config.model.rep_loss}")
+    print(f"  model_size: deter={config.model.deter}, hidden={config.model.hidden}, discrete={config.model.discrete}")
+    if config.model.thick.enabled:
+        t = config.model.thick
+        print(f"  thick: enabled")
+        print(f"    gate_type: {t.gate_type}")
+        print(f"    context: {t.context}")
+        print(f"    gate_noise_scale: {t.gate_noise_scale}")
+        print(f"    coarse_layers: {t.coarse_layers}")
+        print(f"    sparse_free: {t.sparse_free}")
+        print(f"    coarse_critic: {t.coarse_critic}")
+        print(f"    psi: {t.psi}")
+    else:
+        print(f"  thick: disabled")
     if config.model.thick.enabled:
         from thick import ThickDreamer
         agent = ThickDreamer(
