@@ -353,6 +353,35 @@ class Dreamer(nn.Module):
         error = (model - truth + 1.0) / 2.0
         return torch.cat([truth, model, error], 2)
 
+    def context_heatmaps(self):
+        """Generate context and gate heatmap images for TensorBoard.
+
+        Returns a dict of name -> numpy array in (C, H, W) format for add_image,
+        or empty dict if THICK is disabled or no data yet.
+        """
+        if not self._thick_enabled or not hasattr(self, "_last_context"):
+            return {}
+        import numpy as np
+
+        results = {}
+        # Context heatmap: (T, C) -> (C, T) image
+        ctx = self._last_context.cpu().float()  # (T, C)
+        # Normalize per-dimension to [0, 1] for visibility
+        cmin = ctx.min(dim=0, keepdim=True).values
+        cmax = ctx.max(dim=0, keepdim=True).values
+        ctx_norm = (ctx - cmin) / (cmax - cmin + 1e-8)
+        # (C, T) -> (1, C, T) grayscale image
+        results["context_heatmap"] = ctx_norm.T.unsqueeze(0).numpy()
+
+        # Gate heatmap: (T, H_gate) -> (H_gate, T) image
+        gate = self._last_gates.cpu().float()  # (T, H_gate)
+        # For TimeLord H_gate=1, for GateLord/Binary H_gate=context_size
+        # Clamp to [0, 1] (gates are already in this range but be safe)
+        gate_norm = gate.clamp(0, 1)
+        results["gate_heatmap"] = gate_norm.T.unsqueeze(0).numpy()
+
+        return results
+
     def update(self, replay_buffer):
         """Sample a batch from replay and perform one optimization step."""
         data, index, initial = replay_buffer.sample()
@@ -487,7 +516,21 @@ class Dreamer(nn.Module):
         metrics["dyn_entropy"] = torch.mean(self.rssm.get_dist(prior_logit).entropy())
         metrics["rep_entropy"] = torch.mean(self.rssm.get_dist(post_logit).entropy())
         if self._thick_enabled:
-            metrics["gate_frac"] = (gates > 0).float().mean()
+            # Scalar gate metrics
+            gate_open = (gates > 0).float()
+            # Fraction of (batch, time, unit) entries where gate is open
+            metrics["gate_frac"] = gate_open.mean()
+            # Fraction of timesteps where *any* gate unit fires (B, T)
+            metrics["gate_step_frac"] = gate_open.max(dim=-1).values.mean()
+            # Mean magnitude of non-zero gates
+            gate_nonzero = gates[gates > 0]
+            metrics["gate_magnitude"] = gate_nonzero.mean() if gate_nonzero.numel() > 0 else torch.tensor(0.0)
+            # Context change: L2 norm of consecutive differences, averaged
+            ctx_diff = post_context[:, 1:] - post_context[:, :-1]
+            metrics["context_change_norm"] = ctx_diff.norm(dim=-1).mean()
+            # Store for heatmap logging (first batch element only, detached)
+            self._last_context = post_context[0].detach()  # (T, C)
+            self._last_gates = gates[0].detach()  # (T, H_gate)
 
         # === Imagination rollout for actor-critic ===
         start = (
@@ -511,7 +554,7 @@ class Dreamer(nn.Module):
 
         if self._thick_enabled and self._use_coarse_critic:
             imag_coarse_value = self._frozen_coarse_value(imag_coarse_feat).mode()
-            mixed_value = self._psi * imag_coarse_value + (1 - self._psi) * imag_value
+            mixed_value = self._psi * imag_value + (1 - self._psi) * imag_coarse_value
             ret = self._lambda_return(last, term, imag_reward, mixed_value, mixed_value, disc, self.lamb)
         else:
             ret = self._lambda_return(last, term, imag_reward, imag_value, imag_value, disc, self.lamb)

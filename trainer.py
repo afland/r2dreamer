@@ -1,3 +1,4 @@
+import numpy as np
 import torch
 
 import tools
@@ -42,6 +43,7 @@ class OnlineTrainer:
         log_metrics = {}
         # cache is only used for video logging / open-loop prediction.
         cache = []
+        context_cache = []  # collect context vectors for overlay
         agent_state = agent.get_initial_state(envs.env_num)
         # (B, A)
         act = agent_state["prev_action"].clone()
@@ -66,6 +68,9 @@ class OnlineTrainer:
                 cache.append(trans.clone())
             # (B, A)
             act, agent_state = agent.act(trans, agent_state, eval=True)
+            # Collect context/gate for video overlay (env 0 only)
+            if "context" in agent_state.keys():
+                context_cache.append(agent_state["context"][0].detach().cpu())
             returns += trans["reward"][:, 0] * ~once_done
             for key, value in trans.items():
                 if key.startswith("log_"):
@@ -82,7 +87,10 @@ class OnlineTrainer:
                 value = torch.clip(value, max=1.0)  # make sure 1.0 for success episode
             self.logger.scalar(f"episode/eval_{key[4:]}", value.mean())
         if cache is not None and "image" in cache:
-            self.logger.video("eval_video", tools.to_np(cache["image"][:1]))
+            video = tools.to_np(cache["image"][:1])  # (1, T, H, W, C)
+            if len(context_cache) > 0:
+                video = self._overlay_context(video, context_cache)
+            self.logger.video("eval_video", video)
         if self.video_pred_log and cache is not None:
             initial = agent.get_initial_state(1)
             if "context" in initial.keys():
@@ -100,6 +108,70 @@ class OnlineTrainer:
             )
         self.logger.write(train_step)
         agent.train()
+
+    @staticmethod
+    def _overlay_context(video, context_cache):
+        """Append context visualization strip to the right of each video frame.
+
+        Args:
+            video: (1, T_vid, H, W, C) numpy array, float [0,1] or uint8.
+            context_cache: list of (C_ctx,) tensors, one per eval step.
+
+        Returns:
+            (1, T_vid, H, W + strip_width, C) numpy array.
+        """
+        is_float = np.issubdtype(video.dtype, np.floating)
+        T_vid = video.shape[1]
+        H, W, C = video.shape[2], video.shape[3], video.shape[4]
+
+        # Stack context: (T_ctx, C_ctx)
+        ctx = torch.stack(context_cache).float().numpy()
+        T_ctx, C_ctx = ctx.shape
+        # Truncate or pad to match video length
+        if T_ctx > T_vid:
+            ctx = ctx[:T_vid]
+        elif T_ctx < T_vid:
+            ctx = np.pad(ctx, ((0, T_vid - T_ctx), (0, 0)), mode="edge")
+
+        # Normalize globally for consistent coloring across time
+        cmin, cmax = ctx.min(), ctx.max()
+        ctx_norm = (ctx - cmin) / (cmax - cmin + 1e-8)  # (T, C_ctx) in [0, 1]
+
+        # Render strip: scale C_ctx rows to image height H
+        # Each context dim gets H // C_ctx pixels (at least 1)
+        pixels_per_dim = max(1, H // C_ctx)
+        strip_h = pixels_per_dim * C_ctx
+        # (T, C_ctx) -> (T, strip_h) by repeating each dim
+        ctx_expanded = np.repeat(ctx_norm, pixels_per_dim, axis=1)  # (T, strip_h)
+        # Pad or crop to exactly H
+        if strip_h < H:
+            ctx_expanded = np.pad(ctx_expanded, ((0, 0), (0, H - strip_h)), mode="constant")
+        else:
+            ctx_expanded = ctx_expanded[:, :H]
+
+        # Convert to RGB using a blue-red colormap
+        # 0 = blue (0, 0, 1), 1 = red (1, 0, 0)
+        strip_w = 8
+        strip = np.zeros((T_vid, H, strip_w, 3), dtype=np.float32)
+        vals = ctx_expanded[:, :, None]  # (T, H, 1)
+        strip[..., 0] = vals  # R
+        strip[..., 2] = 1.0 - vals  # B
+
+        # Add a 1px black separator
+        sep = np.zeros((T_vid, H, 1, 3), dtype=np.float32)
+
+        if not is_float:
+            video_f = video.astype(np.float32) / 255.0
+        else:
+            video_f = video
+
+        # video_f: (1, T, H, W, C) -> (T, H, W, C) for env 0
+        frames = video_f[0]  # (T, H, W, C)
+        # Only use RGB channels
+        frames_rgb = frames[..., :3]
+        # Concat: frame | separator | context strip
+        combined = np.concatenate([frames_rgb, sep, strip], axis=2)  # (T, H, W+1+strip_w, 3)
+        return combined[None]  # (1, T, H, W+1+strip_w, 3)
 
     def begin(self, agent):
         """Main online training loop.
@@ -192,6 +264,8 @@ class OnlineTrainer:
                     if self.video_pred_log:
                         data, _, initial = self.replay_buffer.sample()
                         self.logger.video("open_loop", tools.to_np(agent.video_pred(data, initial)))
+                    for name, img in agent.context_heatmaps().items():
+                        self.logger.image(f"train/{name}", img)
                     if self.params_hist_log:
                         for name, param in agent._named_params.items():
                             self.logger.histogram(name, tools.to_np(param))
