@@ -88,7 +88,7 @@ class OnlineTrainer:
             if "context" in initial.keys():
                 init_tuple = (initial["stoch"], initial["deter"], initial["context"])
             else:
-                init_tuple = (initial["stoch"], initial["deter"])
+                init_tuple = (initial["stoch"], initial["deter"], None)
             self.logger.video(
                 "eval_open_loop",
                 tools.to_np(

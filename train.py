@@ -56,19 +56,12 @@ def main(config):
         print(f"    psi: {t.psi}")
     else:
         print(f"  thick: disabled")
-    if config.model.thick.enabled:
-        from thick import ThickDreamer
-        agent = ThickDreamer(
-            config.model,
-            obs_space,
-            act_space,
-        ).to(config.device)
-    else:
-        agent = Dreamer(
-            config.model,
-            obs_space,
-            act_space,
-        ).to(config.device)
+
+    agent = Dreamer(
+        config.model,
+        obs_space,
+        act_space,
+    ).to(config.device)
 
     policy_trainer = OnlineTrainer(config.trainer, replay_buffer, logger, logdir, train_envs, eval_envs)
     policy_trainer.begin(agent)

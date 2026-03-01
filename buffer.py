@@ -35,10 +35,8 @@ class Buffer:
         elif src_dev != self.device:
             sample_td = sample_td.to(self.device, non_blocking=True)
         # The initial ones are used only to extract the latent vector
-        if "context" in sample_td.keys():
-            initial = (sample_td["stoch"][:, 0], sample_td["deter"][:, 0], sample_td["context"][:, 0])
-        else:
-            initial = (sample_td["stoch"][:, 0], sample_td["deter"][:, 0])
+        context = sample_td["context"][:, 0] if "context" in sample_td.keys() else None
+        initial = (sample_td["stoch"][:, 0], sample_td["deter"][:, 0], context)
         data = sample_td[:, 1:]
         data.set_("action", sample_td["action"][:, :-1])  # action is 1 step back
         index = [ind.view(-1, self.batch_length + 1)[:, 1:] for ind in info["index"]]

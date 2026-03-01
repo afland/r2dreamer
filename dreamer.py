@@ -12,6 +12,7 @@ from torch.optim.lr_scheduler import LambdaLR
 import networks
 import rssm
 import tools
+from gatelord import sparse_loss
 from networks import Projector
 from optim import LaProp, clip_grad_agc_
 from tools import to_f32
@@ -30,11 +31,18 @@ class Dreamer(nn.Module):
         self.act_dim = act_space.n if hasattr(act_space, "n") else sum(act_space.shape)
         self.rep_loss = str(config.rep_loss)
 
+        # THICK config
+        self._thick_enabled = bool(config.thick.enabled)
+        if self._thick_enabled:
+            self._sparse_free = float(config.rssm.sparse_free)
+            self._use_coarse_critic = bool(config.thick.coarse_critic)
+            self._psi = float(config.thick.psi)
+
         # World model components
         shapes = {k: tuple(v.shape) for k, v in obs_space.spaces.items()}
         self.encoder = networks.MultiEncoder(config.encoder, shapes)
         self.embed_size = self.encoder.out_dim
-        self.rssm = self._make_rssm(config, self.embed_size, self.act_dim)
+        self.rssm = rssm.RSSM(config.rssm, self.embed_size, self.act_dim, has_context=self._thick_enabled)
         self.reward = networks.MLPHead(config.reward, self.rssm.feat_size)
         self.cont = networks.MLPHead(config.cont, self.rssm.feat_size)
 
@@ -82,7 +90,6 @@ class Dreamer(nn.Module):
             self._loss_scales.update({k: recon for k in self.decoder.all_keys})
             modules.update({"decoder": self.decoder})
         elif self.rep_loss == "r2dreamer" or self.rep_loss == "infonce":
-            # add projector for latent to embedding
             self.prj = Projector(self.rssm.feat_size, self.embed_size)
             modules.update({"projector": self.prj})
             self.barlow_lambd = float(config.r2dreamer.lambd)
@@ -119,22 +126,28 @@ class Dreamer(nn.Module):
                 "ema_obs_proj": self._ema_obs_proj,
             })
 
-        # Hook for subclasses to add extra modules (e.g. THICK).
-        modules = self._extend_modules(config, obs_space, act_space, shapes, modules)
+        # THICK-specific modules
+        if self._thick_enabled:
+            if self.rep_loss == "dreamer":
+                self.coarse_decoder = networks.MultiDecoder(
+                    config.decoder,
+                    self.rssm._context_size,
+                    self.rssm.flat_stoch,
+                    shapes,
+                )
+                modules["coarse_decoder"] = self.coarse_decoder
+            elif self.rep_loss in ("r2dreamer", "infonce"):
+                self.coarse_prj = Projector(self.rssm.coarse_feat_size, self.embed_size)
+                modules["coarse_projector"] = self.coarse_prj
 
-        self._build_optimizer(config, modules)
+            if self._use_coarse_critic:
+                self.coarse_value = networks.MLPHead(config.critic, self.rssm.coarse_feat_size)
+                self._slow_coarse_value = copy.deepcopy(self.coarse_value)
+                for param in self._slow_coarse_value.parameters():
+                    param.requires_grad = False
+                modules["coarse_value"] = self.coarse_value
 
-    def _make_rssm(self, config, embed_size, act_dim):
-        """Create the RSSM. Override in subclasses to use a different model (e.g. CRSSM)."""
-        return rssm.RSSM(config.rssm, embed_size, act_dim)
-
-    def _extend_modules(self, config, obs_space, act_space, shapes, modules):
-        """Hook for subclasses to add extra modules before optimizer is built.
-        Returns the (possibly augmented) modules dict."""
-        return modules
-
-    def _build_optimizer(self, config, modules):
-        """Build optimizer, scheduler, and finalize model setup."""
+        # Build optimizer
         for key, module in modules.items():
             if isinstance(module, nn.Parameter):
                 print(f"{module.numel():>14,}: {key}")
@@ -176,23 +189,26 @@ class Dreamer(nn.Module):
             self._cal_grad = torch.compile(self._cal_grad, mode="reduce-overhead")
 
     def _update_slow_target(self):
-        """Update slow-moving value target network."""
-        if self._slow_value_updates % self.slow_target_update == 0:
+        """Update slow-moving value target network(s)."""
+        should_update = self._slow_value_updates % self.slow_target_update == 0
+        if should_update:
             with torch.no_grad():
                 mix = self.slow_target_fraction
                 for v, s in zip(self.value.parameters(), self._slow_value.parameters()):
                     s.data.copy_(mix * v.data + (1 - mix) * s.data)
+                if self._thick_enabled and self._use_coarse_critic:
+                    for v, s in zip(self.coarse_value.parameters(), self._slow_coarse_value.parameters()):
+                        s.data.copy_(mix * v.data + (1 - mix) * s.data)
         self._slow_value_updates += 1
 
     def train(self, mode=True):
         super().train(mode)
-        # slow_value should be always eval mode
         self._slow_value.train(False)
+        if self._thick_enabled and getattr(self, "_use_coarse_critic", False) and hasattr(self, "_slow_coarse_value"):
+            self._slow_coarse_value.train(False)
         return self
 
     def clone_and_freeze(self):
-        # NOTE: "requires_grad" affects whether a parameter is updated
-        # not whether gradients flow through its operations
         self._frozen_encoder = copy.deepcopy(self.encoder)
         for (name_orig, param_orig), (name_new, param_new) in zip(
             self.encoder.named_parameters(), self._frozen_encoder.named_parameters()
@@ -249,42 +265,58 @@ class Dreamer(nn.Module):
             param_new.data = param_orig.data
             param_new.requires_grad_(False)
 
+        if self._thick_enabled and self._use_coarse_critic and hasattr(self, "coarse_value"):
+            self._frozen_coarse_value = copy.deepcopy(self.coarse_value)
+            for (name_orig, param_orig), (name_new, param_new) in zip(
+                self.coarse_value.named_parameters(), self._frozen_coarse_value.named_parameters()
+            ):
+                assert name_orig == name_new
+                param_new.data = param_orig.data
+                param_new.requires_grad_(False)
+
+            self._frozen_slow_coarse_value = copy.deepcopy(self._slow_coarse_value)
+            for (name_orig, param_orig), (name_new, param_new) in zip(
+                self._slow_coarse_value.named_parameters(), self._frozen_slow_coarse_value.named_parameters()
+            ):
+                assert name_orig == name_new
+                param_new.data = param_orig.data
+                param_new.requires_grad_(False)
+
     def to(self, *args, **kwargs):
         super().to(*args, **kwargs)
-        # Re-establish shared memory after moving the model to a new device
         self.clone_and_freeze()
         return self
 
     @torch.no_grad()
     def act(self, obs, state, eval=False):
         """Policy inference step."""
-        # obs: dict of (B, *), state: (stoch: (B, S, K), deter: (B, D), prev_action: (B, A))
         torch.compiler.cudagraph_mark_step_begin()
         p_obs = self.preprocess(obs)
-        # (B, E)
         embed = self._frozen_encoder(p_obs)
-        prev_stoch, prev_deter, prev_action = (
-            state["stoch"],
-            state["deter"],
-            state["prev_action"],
+        prev_stoch = state["stoch"]
+        prev_deter = state["deter"]
+        prev_context = state.get("context", None)
+        prev_action = state["prev_action"]
+
+        stoch, deter, context, _, _, _ = self._frozen_rssm.obs_step(
+            prev_stoch, prev_deter, prev_context, prev_action, embed, obs["is_first"]
         )
-        # (B, S, K), (B, D)
-        stoch, deter, _ = self._frozen_rssm.obs_step(prev_stoch, prev_deter, prev_action, embed, obs["is_first"])
-        # (B, F)
-        feat = self._frozen_rssm.get_feat(stoch, deter)
+        feat = self._frozen_rssm.get_feat(stoch, deter, context)
         action_dist = self._frozen_actor(feat)
-        # (B, A)
         action = action_dist.mode if eval else action_dist.rsample()
-        return action, TensorDict(
-            {"stoch": stoch, "deter": deter, "prev_action": action},
-            batch_size=state.batch_size,
-        )
+        new_state = {"stoch": stoch, "deter": deter, "prev_action": action}
+        if context is not None:
+            new_state["context"] = context
+        return action, TensorDict(new_state, batch_size=state.batch_size)
 
     @torch.no_grad()
     def get_initial_state(self, B):
-        stoch, deter = self.rssm.initial(B)
+        stoch, deter, context = self.rssm.initial(B)
         action = torch.zeros(B, self.act_dim, dtype=torch.float32, device=self.device)
-        return TensorDict({"stoch": stoch, "deter": deter, "prev_action": action}, batch_size=(B,))
+        state = {"stoch": stoch, "deter": deter, "prev_action": action}
+        if context is not None:
+            state["context"] = context
+        return TensorDict(state, batch_size=(B,))
 
     @torch.no_grad()
     def video_pred(self, data, initial):
@@ -298,20 +330,21 @@ class Dreamer(nn.Module):
             raise NotImplementedError("video_pred requires decoder and is only supported when rep_loss == 'dreamer'.")
 
         B = min(data["action"].shape[0], 6)
-        # (B, T, E)
         embed = self.encoder(data)
 
-        post_stoch, post_deter, _ = self.rssm.observe(
+        post_stoch, post_deter, post_context, _, _, _ = self.rssm.observe(
             embed[:B, :5],
             data["action"][:B, :5],
-            tuple(val[:B] for val in initial),
+            tuple(val[:B] if val is not None else None for val in initial),
             data["is_first"][:B, :5],
         )
         recon = self.decoder(post_stoch, post_deter)["image"].mode()[:B]
         init_stoch, init_deter = post_stoch[:, -1], post_deter[:, -1]
-        prior_stoch, prior_deter = self.rssm.imagine_with_action(
+        init_context = post_context[:, -1] if post_context is not None else None
+        prior_stoch, prior_deter, _, _ = self.rssm.imagine_with_action(
             init_stoch,
             init_deter,
+            init_context,
             data["action"][:B, 5:],
         )
         openl = self.decoder(prior_stoch, prior_deter)["image"].mode()
@@ -330,22 +363,22 @@ class Dreamer(nn.Module):
             self.ema_update()
         metrics = {}
         with autocast(device_type=self.device.type, dtype=torch.float16):
-            (stoch, deter), mets = self._cal_grad(p_data, initial)
-        self._scaler.unscale_(self._optimizer)  # unscale grads in params
+            (stoch, deter, context), mets = self._cal_grad(p_data, initial)
+        self._scaler.unscale_(self._optimizer)
         if self.rep_loss == "dreamerpro" and self._ema_updates < self.freeze_prototypes_iters:
             self._prototypes.grad.zero_()
         if self._log_grads:
             old_params = [p.data.clone().detach() for p in self._named_params.values()]
-            grads = [p.grad for p in self._named_params.values() if p.grad is not None]  # log grads before clipping
+            grads = [p.grad for p in self._named_params.values() if p.grad is not None]
             grad_norm = tools.compute_global_norm(grads)
             grad_rms = tools.compute_rms(grads)
             mets["opt/grad_norm"] = grad_norm
             mets["opt/grad_rms"] = grad_rms
-        self._agc(self._named_params.values())  # clipping
-        self._scaler.step(self._optimizer)  # update params
-        self._scaler.update()  # adjust scale
-        self._scheduler.step()  # increment scheduler
-        self._optimizer.zero_grad(set_to_none=True)  # reset grads
+        self._agc(self._named_params.values())
+        self._scaler.step(self._optimizer)
+        self._scaler.update()
+        self._scheduler.step()
+        self._optimizer.zero_grad(set_to_none=True)
         mets["opt/lr"] = self._scheduler.get_lr()[0]
         mets["opt/grad_scale"] = self._scaler.get_scale()
         if self._log_grads:
@@ -355,86 +388,93 @@ class Dreamer(nn.Module):
             mets["opt/param_rms"] = params_rms
             mets["opt/update_rms"] = update_rms
         metrics.update(mets)
-        # update latent vectors in replay buffer
-        replay_buffer.update(index, stoch.detach(), deter.detach())
+        replay_buffer.update(index, stoch.detach(), deter.detach(), context.detach() if context is not None else None)
         return metrics
 
     def _cal_grad(self, data, initial):
-        """Compute gradients for one batch.
-
-        Notes
-        -----
-        This function computes:
-        1) World model loss (dynamics + representation)
-        2) Optional representation loss variants (Dreamer, R2-Dreamer, InfoNCE, DreamerPro)
-        3) Imagination rollouts for actor-critic updates
-        4) Replay-based value learning
-        """
-        # data: dict of (B, T, *), initial: (stoch: (B, S, K), deter: (B, D))
+        """Compute gradients for one batch."""
         losses = {}
         metrics = {}
         B, T = data.shape
 
         # === World model: posterior rollout and KL losses ===
-        # (B, T, E)
         embed = self.encoder(data)
-        # (B, T, S, K), (B, T, D), (B, T, S, K)
-        post_stoch, post_deter, post_logit = self.rssm.observe(embed, data["action"], initial, data["is_first"])
-        # (B, T, S, K)
-        _, prior_logit = self.rssm.prior(post_deter)
+        post_stoch, post_deter, post_context, post_logit, coarse_logit, gates = self.rssm.observe(
+            embed, data["action"], initial, data["is_first"]
+        )
+
+        _, prior_logit = self.rssm.prior(post_deter, post_context)
         dyn_loss, rep_loss = self.rssm.kl_loss(post_logit, prior_logit, self.kl_free)
         losses["dyn"] = torch.mean(dyn_loss)
         losses["rep"] = torch.mean(rep_loss)
+
+        # THICK coarse KL + sparsity losses
+        if self._thick_enabled:
+            coarse_dyn, coarse_rep = self.rssm.coarse_kl_loss(post_logit, coarse_logit, self.kl_free)
+            losses["coarse_dyn"] = torch.mean(coarse_dyn)
+            losses["coarse_rep"] = torch.mean(coarse_rep)
+            losses["sparse"] = sparse_loss(gates, free_nats=self._sparse_free)
+
         # === Representation / auxiliary losses ===
-        # (B, T, F)
-        feat = self.rssm.get_feat(post_stoch, post_deter)
+        feat = self.rssm.get_feat(post_stoch, post_deter, post_context)
         if self.rep_loss == "dreamer":
             recon_losses = {
                 key: torch.mean(-dist.log_prob(data[key])) for key, dist in self.decoder(post_stoch, post_deter).items()
             }
             losses.update(recon_losses)
+            if self._thick_enabled:
+                coarse_recon_losses = {
+                    f"coarse_{key}": torch.mean(-dist.log_prob(data[key]))
+                    for key, dist in self.coarse_decoder(post_stoch, post_context).items()
+                }
+                losses["coarse_recon"] = sum(coarse_recon_losses.values())
         elif self.rep_loss == "r2dreamer":
-            # R2-Dreamer: Barlow Twins style redundancy reduction between latent features and encoder embeddings.
-            # Flatten batch/time dims for a single cross-correlation matrix.
-            # (B, T, F) -> (B*T, F)
             x1 = self.prj(feat[:, :].reshape(B * T, -1))
-            # (B, T, E) -> (B*T, E)
-            x2 = embed.reshape(B * T, -1).detach()  # this detach is important
-
+            x2 = embed.reshape(B * T, -1).detach()
             x1_norm = (x1 - x1.mean(0)) / (x1.std(0) + 1e-8)
             x2_norm = (x2 - x2.mean(0)) / (x2.std(0) + 1e-8)
-
             c = torch.mm(x1_norm.T, x2_norm) / (B * T)
             invariance_loss = (torch.diagonal(c) - 1.0).pow(2).sum()
             off_diag_mask = ~torch.eye(x1.shape[-1], dtype=torch.bool, device=x1.device)
             redundancy_loss = c[off_diag_mask].pow(2).sum()
             losses["barlow"] = invariance_loss + self.barlow_lambd * redundancy_loss
+            if self._thick_enabled:
+                coarse_feat = self.rssm.get_coarse_feat(post_stoch, post_context)
+                cx1 = self.coarse_prj(coarse_feat.reshape(B * T, -1))
+                cx2 = embed.reshape(B * T, -1).detach()
+                cx1_norm = (cx1 - cx1.mean(0)) / (cx1.std(0) + 1e-8)
+                cx2_norm = (cx2 - cx2.mean(0)) / (cx2.std(0) + 1e-8)
+                cc = torch.mm(cx1_norm.T, cx2_norm) / (B * T)
+                c_invariance = (torch.diagonal(cc) - 1.0).pow(2).sum()
+                c_off_diag_mask = ~torch.eye(cx1.shape[-1], dtype=torch.bool, device=cx1.device)
+                c_redundancy = cc[c_off_diag_mask].pow(2).sum()
+                losses["coarse_barlow"] = c_invariance + self.barlow_lambd * c_redundancy
         elif self.rep_loss == "infonce":
-            # Contrastive (InfoNCE) objective between projected latent features and encoder embeddings.
-            # (B, T, F) -> (B*T, F)
             x1 = self.prj(feat[:, :].reshape(B * T, -1))
-            # (B, T, E) -> (B*T, E)
-            x2 = embed.reshape(B * T, -1).detach()  # this detach is important
+            x2 = embed.reshape(B * T, -1).detach()
             logits = torch.matmul(x1, x2.T)
             norm_logits = logits - torch.max(logits, 1)[0][:, None]
             labels = torch.arange(norm_logits.shape[0]).long().to(self.device)
             losses["infonce"] = torch.nn.functional.cross_entropy(norm_logits, labels)
+            if self._thick_enabled:
+                coarse_feat = self.rssm.get_coarse_feat(post_stoch, post_context)
+                cx1 = self.coarse_prj(coarse_feat.reshape(B * T, -1))
+                cx2 = embed.reshape(B * T, -1).detach()
+                c_logits = torch.matmul(cx1, cx2.T)
+                c_norm_logits = c_logits - torch.max(c_logits, 1)[0][:, None]
+                losses["coarse_infonce"] = F.cross_entropy(c_norm_logits, labels)
         elif self.rep_loss == "dreamerpro":
-            # DreamerPro uses augmentation + EMA targets + Sinkhorn assignment.
             with torch.no_grad():
                 data_aug = self.augment_data(data)
-                initial_aug = (
-                    # (B, ...) -> (2B, ...)
-                    torch.cat([initial[0], initial[0]], dim=0),
-                    torch.cat([initial[1], initial[1]], dim=0),
+                initial_aug = tuple(
+                    torch.cat([v, v], dim=0) if v is not None else None for v in initial
                 )
                 ema_proj = self.ema_proj(data_aug)
-
             embed_aug = self.encoder(data_aug)
-            post_stoch_aug, post_deter_aug, _ = self.rssm.observe(
+            post_stoch_aug, post_deter_aug, post_context_aug, _, _, _ = self.rssm.observe(
                 embed_aug, data_aug["action"], initial_aug, data_aug["is_first"]
             )
-            proto_losses = self.proto_loss(post_stoch_aug, post_deter_aug, embed_aug, ema_proj)
+            proto_losses = self.proto_loss(post_stoch_aug, post_deter_aug, embed_aug, ema_proj, post_context_aug)
             losses.update(proto_losses)
         else:
             raise NotImplementedError
@@ -446,44 +486,45 @@ class Dreamer(nn.Module):
         # log
         metrics["dyn_entropy"] = torch.mean(self.rssm.get_dist(prior_logit).entropy())
         metrics["rep_entropy"] = torch.mean(self.rssm.get_dist(post_logit).entropy())
+        if self._thick_enabled:
+            metrics["gate_frac"] = (gates > 0).float().mean()
 
         # === Imagination rollout for actor-critic ===
-        # (B*T, S, K), (B*T, D)
         start = (
             post_stoch.reshape(-1, *post_stoch.shape[2:]).detach(),
             post_deter.reshape(-1, *post_deter.shape[2:]).detach(),
+            post_context.reshape(-1, *post_context.shape[2:]).detach() if post_context is not None else None,
         )
-        # (B, T, ...) -> (B*T, ...)
-        imag_feat, imag_action = self._imagine(start, self.imag_horizon + 1)
+        imag_feat, imag_action, imag_coarse_feat = self._imagine(start, self.imag_horizon + 1)
         imag_feat, imag_action = imag_feat.detach(), imag_action.detach()
+        if imag_coarse_feat is not None:
+            imag_coarse_feat = imag_coarse_feat.detach()
 
-        # (B*T, T_imag, 1)
         imag_reward = self._frozen_reward(imag_feat).mode()
-        # (B*T, T_imag, 1)  probability of continuation
         imag_cont = self._frozen_cont(imag_feat).mean
-        # (B*T, T_imag, 1)
         imag_value = self._frozen_value(imag_feat).mode()
         imag_slow_value = self._frozen_slow_value(imag_feat).mode()
         disc = 1 - 1 / self.horizon
-        # (B*T, T_imag, 1)
         weight = torch.cumprod(imag_cont * disc, dim=1)
         last = torch.zeros_like(imag_cont)
         term = 1 - imag_cont
-        ret = self._lambda_return(
-            last, term, imag_reward, imag_value, imag_value, disc, self.lamb
-        )  # (B*T, T_imag-1, 1)
+
+        if self._thick_enabled and self._use_coarse_critic:
+            imag_coarse_value = self._frozen_coarse_value(imag_coarse_feat).mode()
+            mixed_value = self._psi * imag_coarse_value + (1 - self._psi) * imag_value
+            ret = self._lambda_return(last, term, imag_reward, mixed_value, mixed_value, disc, self.lamb)
+        else:
+            ret = self._lambda_return(last, term, imag_reward, imag_value, imag_value, disc, self.lamb)
+
         ret_offset, ret_scale = self.return_ema(ret)
-        # (B*T, T_imag-1, 1)
         adv = (ret - imag_value[:, :-1]) / ret_scale
 
         policy = self.actor(imag_feat)
-        # (B*T, T_imag-1, 1)
         logpi = policy.log_prob(imag_action)[:, :-1].unsqueeze(-1)
         entropy = policy.entropy()[:, :-1].unsqueeze(-1)
         losses["policy"] = torch.mean(weight[:, :-1].detach() * -(logpi * adv.detach() + self.act_entropy * entropy))
 
         imag_value_dist = self.value(imag_feat)
-        # (B*T, T_imag, 1)
         tar_padded = torch.cat([ret, 0 * ret[:, -1:]], 1)
         losses["value"] = torch.mean(
             weight[:, :-1].detach()
@@ -491,6 +532,17 @@ class Dreamer(nn.Module):
                 :, :-1
             ].unsqueeze(-1)
         )
+
+        # Coarse value loss (if enabled)
+        if self._thick_enabled and self._use_coarse_critic:
+            imag_coarse_value_dist = self.coarse_value(imag_coarse_feat)
+            losses["coarse_value"] = torch.mean(
+                weight[:, :-1].detach()
+                * (-imag_coarse_value_dist.log_prob(tar_padded.detach()))[
+                    :, :-1
+                ].unsqueeze(-1)
+            )
+
         # log
         ret_normed = (ret - ret_offset) / ret_scale
         metrics["ret"] = torch.mean(ret_normed)
@@ -513,7 +565,7 @@ class Dreamer(nn.Module):
             to_f32(data["is_terminal"]),
             to_f32(data["reward"]),
         )
-        feat = self.rssm.get_feat(post_stoch, post_deter)
+        feat = self.rssm.get_feat(post_stoch, post_deter, post_context)
         boot = ret[:, 0].reshape(B, T, 1)
         value = self._frozen_value(feat).mode()
         slow_value = self._frozen_slow_value(feat).mode()
@@ -522,7 +574,6 @@ class Dreamer(nn.Module):
         ret = self._lambda_return(last, term, reward, value, boot, disc, self.lamb)
         ret_padded = torch.cat([ret, 0 * ret[:, -1:]], 1)
 
-        # Keep this attached to the world model so gradients can flow through
         value_dist = self.value(feat)
         losses["repval"] = torch.mean(
             weight[:, :-1]
@@ -530,6 +581,16 @@ class Dreamer(nn.Module):
                 -1
             )
         )
+
+        # Coarse replay value loss
+        if self._thick_enabled and self._use_coarse_critic:
+            coarse_feat_replay = self.rssm.get_coarse_feat(post_stoch, post_context)
+            coarse_value_dist_replay = self.coarse_value(coarse_feat_replay)
+            losses["coarse_repval"] = torch.mean(
+                weight[:, :-1]
+                * (-coarse_value_dist_replay.log_prob(ret_padded.detach()))[:, :-1].unsqueeze(-1)
+            )
+
         # log
         metrics.update(tools.tensorstats(ret, "ret_replay"))
         metrics.update(tools.tensorstats(value, "value_replay"))
@@ -540,28 +601,29 @@ class Dreamer(nn.Module):
 
         metrics.update({f"loss/{name}": loss for name, loss in losses.items()})
         metrics.update({"opt/loss": total_loss})
-        return (post_stoch, post_deter), metrics
+        return (post_stoch, post_deter, post_context), metrics
 
     @torch.no_grad()
     def _imagine(self, start, imag_horizon):
         """Roll out the policy in latent space."""
-        # (B, S, K), (B, D)
         feats = []
         actions = []
-        stoch, deter = start
+        stoch, deter, context = start
+        use_coarse = self._thick_enabled and self._use_coarse_critic
+        coarse_feats = [] if use_coarse else None
         for _ in range(imag_horizon):
-            # (B, F)
-            feat = self._frozen_rssm.get_feat(stoch, deter)
-            # (B, A)
+            feat = self._frozen_rssm.get_feat(stoch, deter, context)
             action = self._frozen_actor(feat).rsample()
-            # Append feat and its corresponding sampled action at the same time step.
             feats.append(feat)
             actions.append(action)
-            stoch, deter = self._frozen_rssm.img_step(stoch, deter, action)
+            if use_coarse:
+                coarse_feats.append(self._frozen_rssm.get_coarse_feat(stoch, context))
+            stoch, deter, context, _ = self._frozen_rssm.img_step(stoch, deter, context, action)
 
-        # Stack along sequence dim T_imag.
-        # (B, T_imag, F), (B, T_imag, A)
-        return torch.stack(feats, dim=1), torch.stack(actions, dim=1)
+        stacked_feats = torch.stack(feats, dim=1)
+        stacked_actions = torch.stack(actions, dim=1)
+        stacked_coarse = torch.stack(coarse_feats, dim=1) if coarse_feats is not None else None
+        return stacked_feats, stacked_actions, stacked_coarse
 
     @torch.no_grad()
     def _lambda_return(self, last, term, reward, value, boot, disc, lamb):
@@ -587,7 +649,6 @@ class Dreamer(nn.Module):
     @torch.no_grad()
     def augment_data(self, data):
         data_aug = {k: torch.cat([v, v], axis=0) for k, v in data.items()}
-        # (B, T, H, W, C) -> (B, T, C, H, W)
         image = data_aug["image"].permute(0, 1, 4, 2, 3)
         data_aug["image"] = self.random_translate(
             image,
@@ -595,7 +656,6 @@ class Dreamer(nn.Module):
             same_across_time=self.aug_same_across_time,
             bilinear=self.aug_bilinear,
         )
-        # (B, T, C, H, W) -> (B, T, H, W, C)
         data_aug["image"] = data_aug["image"].permute(0, 1, 3, 4, 2)
         return data_aug
 
@@ -619,14 +679,6 @@ class Dreamer(nn.Module):
         self._ema_updates += 1
 
     def sinkhorn(self, scores):
-        """Sinkhorn-Knopp normalization.
-
-        Notes
-        -----
-        Given a score matrix, we iteratively normalize rows and columns in log
-        space so that the resulting assignment matrix is approximately doubly
-        stochastic.
-        """
         shape = scores.shape
         K = shape[0]
         scores = scores.reshape(-1)
@@ -642,7 +694,7 @@ class Dreamer(nn.Module):
         Q = torch.exp(log_Q)
         return Q.reshape(shape)
 
-    def proto_loss(self, post_stoch, post_deter, embed, ema_proj):
+    def proto_loss(self, post_stoch, post_deter, embed, ema_proj, post_context=None):
         prototypes = F.normalize(self._prototypes, p=2, dim=-1)
 
         obs_proj = self.obs_proj(embed)
@@ -650,19 +702,15 @@ class Dreamer(nn.Module):
         obs_proj = F.normalize(obs_proj, p=2, dim=-1)
 
         B, T = obs_proj.shape[:2]
-        # (B, T, P) -> (B*T, P)
         obs_proj = obs_proj.reshape(B * T, -1)
         obs_scores = torch.matmul(obs_proj, prototypes.T)
-        # (B*T, K) -> (B, T, K) -> (K, B, T)
         obs_scores = obs_scores.reshape(B, T, -1).permute(2, 0, 1)
         obs_scores = obs_scores[:, :, self.warm_up :]
         obs_logits = F.log_softmax(obs_scores / self.temperature, dim=0)
         obs_logits_1, obs_logits_2 = torch.chunk(obs_logits, 2, dim=1)
 
-        # (B, T, P) -> (B*T, P)
         ema_proj = ema_proj.reshape(B * T, -1)
         ema_scores = torch.matmul(ema_proj, prototypes.T)
-        # (B*T, K) -> (B, T, K) -> (K, B, T)
         ema_scores = ema_scores.reshape(B, T, -1).permute(2, 0, 1)
         ema_scores = ema_scores[:, :, self.warm_up :]
         ema_scores_1, ema_scores_2 = torch.chunk(ema_scores, 2, dim=1)
@@ -672,15 +720,13 @@ class Dreamer(nn.Module):
             ema_targets_2 = self.sinkhorn(ema_scores_2)
         ema_targets = torch.cat([ema_targets_1, ema_targets_2], dim=1)
 
-        feat = self.rssm.get_feat(post_stoch, post_deter)
+        feat = self.rssm.get_feat(post_stoch, post_deter, post_context)
         feat_proj = self.feat_proj(feat)
         feat_norm = torch.norm(feat_proj, dim=-1)
         feat_proj = F.normalize(feat_proj, p=2, dim=-1)
 
-        # (B, T, P) -> (B*T, P)
         feat_proj = feat_proj.reshape(B * T, -1)
         feat_scores = torch.matmul(feat_proj, prototypes.T)
-        # (B*T, K) -> (B, T, K) -> (K, B, T)
         feat_scores = feat_scores.reshape(B, T, -1).permute(2, 0, 1)
         feat_scores = feat_scores[:, :, self.warm_up :]
         feat_logits = F.log_softmax(feat_scores / self.temperature, dim=0)
@@ -703,11 +749,9 @@ class Dreamer(nn.Module):
         x_flat = x.reshape(B * T, C, H, W)
         pad = int(max_delta)
 
-        # Pad
         x_padded = F.pad(x_flat, (pad, pad, pad, pad), "replicate")
         h_padded, w_padded = H + 2 * pad, W + 2 * pad
 
-        # Create base grid
         eps_h = 1.0 / h_padded
         eps_w = 1.0 / w_padded
         arange_h = torch.linspace(-1.0 + eps_h, 1.0 - eps_h, h_padded, device=x.device, dtype=x.dtype)[:H]
@@ -717,7 +761,6 @@ class Dreamer(nn.Module):
         base_grid = torch.cat([arange_w, arange_h], dim=2)
         base_grid = base_grid.unsqueeze(0).repeat(B * T, 1, 1, 1)
 
-        # Create shift
         if same_across_time:
             shift = torch.randint(0, 2 * pad + 1, size=(B, 1, 1, 1, 2), device=x.device, dtype=x.dtype)
             shift = shift.repeat(1, T, 1, 1, 1).reshape(B * T, 1, 1, 2)
@@ -726,7 +769,6 @@ class Dreamer(nn.Module):
 
         shift = shift * 2.0 / torch.tensor([w_padded, h_padded], device=x.device, dtype=x.dtype)
 
-        # Apply shift and sample
         grid = base_grid + shift
         mode = "bilinear" if bilinear else "nearest"
         x_translated = F.grid_sample(x_padded, grid, mode=mode, padding_mode="zeros", align_corners=False)
