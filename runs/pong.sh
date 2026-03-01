@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Usage: bash runs/memorymaze.sh [OPTIONS]
+# Usage: bash runs/pong.sh [OPTIONS]
 #   --rep_loss    dreamer / r2dreamer          (default: dreamer)
 #   --thick       enable THICK                 (flag, no argument)
 #   --seed        int                          (default: 0)
@@ -31,7 +31,7 @@ else
 fi
 
 TIMESTAMP=$(date +%m%d_%H%M%S)
-RUN_NAME="${VARIANT}_memorymaze_s${SEED}_${TIMESTAMP}"
+RUN_NAME="${VARIANT}_pong_s${SEED}_${TIMESTAMP}"
 
 THICK_FLAG=""
 if [ "$THICK" = "true" ]; then
@@ -39,12 +39,13 @@ if [ "$THICK" = "true" ]; then
 fi
 
 CUDA_VISIBLE_DEVICES=$GPU nohup python -u train.py \
-    env=memorymaze \
-    env.task=memorymaze_9x9 \
+    env=atari100k \
+    env.task=atari_pong \
     model=size50M \
     model.rep_loss=${REP_LOSS} \
     model.compile=True \
     buffer.storage_device=cpu \
+    env.steps=4e6 \
     ${THICK_FLAG} \
     logdir=logdir/${RUN_NAME} \
     seed=${SEED} \

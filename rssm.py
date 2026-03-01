@@ -8,10 +8,11 @@ from tools import rpad, weight_init_
 
 
 class Deter(nn.Module):
-    def __init__(self, deter, stoch, act_dim, hidden, blocks, dynlayers, act="SiLU"):
+    def __init__(self, deter, stoch, act_dim, hidden, blocks, dynlayers, act="SiLU", context_dim=0):
         super().__init__()
         self.blocks = int(blocks)
         self.dynlayers = int(dynlayers)
+        self.context_dim = int(context_dim)
         act = getattr(torch.nn, act)
         self._dyn_in0 = nn.Sequential(
             nn.Linear(deter, hidden, bias=True), nn.RMSNorm(hidden, eps=1e-04, dtype=torch.float32), act()
@@ -22,8 +23,14 @@ class Deter(nn.Module):
         self._dyn_in2 = nn.Sequential(
             nn.Linear(act_dim, hidden, bias=True), nn.RMSNorm(hidden, eps=1e-04, dtype=torch.float32), act()
         )
+        num_inputs = 3
+        if self.context_dim > 0:
+            self._dyn_in3 = nn.Sequential(
+                nn.Linear(context_dim, hidden, bias=True), nn.RMSNorm(hidden, eps=1e-04, dtype=torch.float32), act()
+            )
+            num_inputs = 4
         self._dyn_hid = nn.Sequential()
-        in_ch = (3 * hidden + deter // self.blocks) * self.blocks
+        in_ch = (num_inputs * hidden + deter // self.blocks) * self.blocks
         for i in range(self.dynlayers):
             self._dyn_hid.add_module(f"dyn_hid_{i}", BlockLinear(in_ch, deter, self.blocks))
             self._dyn_hid.add_module(f"norm_{i}", nn.RMSNorm(deter, eps=1e-04, dtype=torch.float32))
@@ -33,9 +40,9 @@ class Deter(nn.Module):
         self.flat2group = lambda x: x.reshape(*x.shape[:-1], self.blocks, -1)
         self.group2flat = lambda x: x.reshape(*x.shape[:-2], -1)
 
-    def forward(self, stoch, deter, action):
+    def forward(self, stoch, deter, action, context=None):
         """Deterministic state transition (block-GRU style)."""
-        # (B, S, K), (B, D), (B, A)
+        # (B, S, K), (B, D), (B, A), optional (B, C)
         B = action.shape[0]
 
         # Flatten stochastic state and normalize action magnitude.
@@ -48,13 +55,16 @@ class Deter(nn.Module):
         x2 = self._dyn_in2(action)
 
         # Concatenate projected inputs and broadcast over blocks.
-        # (B, 3*U)
-        x = torch.cat([x0, x1, x2], -1)
-        # (B, G, 3*U)
+        if self.context_dim > 0 and context is not None:
+            x3 = self._dyn_in3(context)
+            x = torch.cat([x0, x1, x2, x3], -1)
+        else:
+            x = torch.cat([x0, x1, x2], -1)
+        # (B, G, N*U)
         x = x.unsqueeze(-2).expand(-1, self.blocks, -1)
 
         # Combine per-block deterministic state with per-block inputs.
-        # (B, G, D/G + 3*U) -> (B, D + 3*U*G)
+        # (B, G, D/G + N*U) -> (B, D + N*U*G)
         x = self.group2flat(torch.cat([self.flat2group(deter), x], -1))
 
         # (B, D)

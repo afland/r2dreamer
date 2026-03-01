@@ -35,13 +35,16 @@ class Buffer:
         elif src_dev != self.device:
             sample_td = sample_td.to(self.device, non_blocking=True)
         # The initial ones are used only to extract the latent vector
-        initial = (sample_td["stoch"][:, 0], sample_td["deter"][:, 0])
+        if "context" in sample_td.keys():
+            initial = (sample_td["stoch"][:, 0], sample_td["deter"][:, 0], sample_td["context"][:, 0])
+        else:
+            initial = (sample_td["stoch"][:, 0], sample_td["deter"][:, 0])
         data = sample_td[:, 1:]
         data.set_("action", sample_td["action"][:, :-1])  # action is 1 step back
         index = [ind.view(-1, self.batch_length + 1)[:, 1:] for ind in info["index"]]
         return data, index, initial
 
-    def update(self, index, stoch, deter):
+    def update(self, index, stoch, deter, context=None):
         # Flatten the data
         index = [ind.reshape(-1) for ind in index]
         # (B, T, S, K) -> (B*T, S, K)
@@ -51,6 +54,9 @@ class Buffer:
         # In storage, the length is the first dimension, and the batch (number of environments) is the second dimension.
         self._buffer[index[1], index[0]].set_("stoch", stoch)
         self._buffer[index[1], index[0]].set_("deter", deter)
+        if context is not None:
+            context = context.reshape(-1, *context.shape[2:])
+            self._buffer[index[1], index[0]].set_("context", context)
 
     def count(self):
         if self._buffer.storage.shape is None:

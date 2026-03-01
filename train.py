@@ -42,11 +42,19 @@ def main(config):
     train_envs, eval_envs, obs_space, act_space = make_envs(config.env)
 
     print("Simulate agent.")
-    agent = Dreamer(
-        config.model,
-        obs_space,
-        act_space,
-    ).to(config.device)
+    if config.model.thick.enabled:
+        from thick import ThickDreamer
+        agent = ThickDreamer(
+            config.model,
+            obs_space,
+            act_space,
+        ).to(config.device)
+    else:
+        agent = Dreamer(
+            config.model,
+            obs_space,
+            act_space,
+        ).to(config.device)
 
     policy_trainer = OnlineTrainer(config.trainer, replay_buffer, logger, logdir, train_envs, eval_envs)
     policy_trainer.begin(agent)

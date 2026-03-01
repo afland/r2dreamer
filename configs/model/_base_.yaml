@@ -18,6 +18,16 @@ warmup: 1000
 slow_target_update: 1
 slow_target_fraction: 0.02
 
+thick:
+  enabled: False
+  context: 32
+  gate_type: "gatelord"  # gatelord / gatelord_binary / timelord
+  gate_noise_scale: 0.1
+  coarse_layers: 1
+  sparse_free: 0.0
+  coarse_critic: False
+  psi: 0.9
+
 loss_scales:
   barlow: 0.05
   infonce: 1.0
@@ -32,6 +42,14 @@ loss_scales:
   swav: 1.0
   temp: 1.0
   norm: 1.0
+  coarse_dyn: 1.0
+  coarse_rep: 0.1
+  sparse: 10.0
+  coarse_barlow: 0.05
+  coarse_infonce: 1.0
+  coarse_recon: 1.0
+  coarse_value: 1.0
+  coarse_repval: 0.3
 
 r2dreamer:
   lambd: 5e-4
@@ -65,6 +83,11 @@ rssm:
   unimix_ratio: 0.01
   initial: 'learned'
   device: ${device}
+  context: ${model.thick.context}
+  gate_type: ${model.thick.gate_type}
+  gate_noise_scale: ${model.thick.gate_noise_scale}
+  coarse_layers: ${model.thick.coarse_layers}
+  sparse_free: ${model.thick.sparse_free}
 
 encoder:
   mlp_keys: ${env.encoder.mlp_keys}
