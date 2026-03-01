@@ -7,14 +7,15 @@ observe / imagine / act.
 """
 
 import copy
-from collections import OrderedDict
 
 import torch
 import torch.nn.functional as F
 from tensordict import TensorDict
 from torch import nn
+from torch.amp import autocast
 
 import networks
+import tools
 from crssm import CRSSM
 from dreamer import Dreamer
 from gatelord import sparse_loss
@@ -23,141 +24,46 @@ from tools import to_f32
 
 
 class ThickDreamer(Dreamer):
-    """Dreamer with THICK temporal hierarchy."""
+    """Dreamer with THICK temporal hierarchy.
+
+    Uses Dreamer's hook methods (_make_rssm, _extend_modules) to inject
+    CRSSM and coarse modules without rebuilding.
+    """
 
     def __init__(self, config, obs_space, act_space):
-        # --- Call Dreamer.__init__ which sets up everything including clone_and_freeze ---
-        # We need to intercept RSSM creation. We do this by calling super().__init__
-        # and then replacing the RSSM with CRSSM and rebuilding dependent modules.
-        # However, since Dreamer.__init__ uses self.rssm.feat_size for heads,
-        # we need a different approach: override before super().__init__ finishes.
-        #
-        # Strategy: call super().__init__ which builds everything with standard RSSM,
-        # then replace RSSM and rebuild heads/modules that depend on feat_size.
-        # This is simpler and keeps Dreamer.__init__ untouched.
-
-        # Temporarily disable compile so we can rebuild after
-        orig_compile = config.compile
-        config.compile = False
-        super().__init__(config, obs_space, act_space)
-
-        # --- Replace RSSM with CRSSM ---
-        self.rssm = CRSSM(config.rssm, self.embed_size, self.act_dim)
-
-        # --- Rebuild heads that depend on feat_size ---
-        self.reward = networks.MLPHead(config.reward, self.rssm.feat_size)
-        self.cont = networks.MLPHead(config.cont, self.rssm.feat_size)
-
-        # Actor and critic use the larger feat_size.
-        self.actor = networks.MLPHead(config.actor, self.rssm.feat_size)
-        self.value = networks.MLPHead(config.critic, self.rssm.feat_size)
-        self._slow_value = copy.deepcopy(self.value)
-        for param in self._slow_value.parameters():
-            param.requires_grad = False
-        self._slow_value_updates = 0
-
-        # --- THICK-specific config ---
+        # Store THICK config before super().__init__ since hooks need it.
         self._thick_config = config.thick
         self._sparse_free = float(config.rssm.sparse_free)
         self.use_coarse_critic = bool(config.thick.coarse_critic)
         self._psi = float(config.thick.psi)
+        super().__init__(config, obs_space, act_space)
 
-        # --- Coarse representation loss modules ---
-        shapes = {k: tuple(v.shape) for k, v in obs_space.spaces.items()}
+    def _make_rssm(self, config, embed_size, act_dim):
+        """Use CRSSM instead of RSSM."""
+        return CRSSM(config.rssm, embed_size, act_dim)
+
+    def _extend_modules(self, config, obs_space, act_space, shapes, modules):
+        """Add coarse rep loss modules and optional coarse critic."""
         if self.rep_loss == "dreamer":
-            # Rebuild decoder with new feat_size (deter + flat_stoch unchanged).
-            self.decoder = networks.MultiDecoder(
-                config.decoder,
-                self.rssm._deter,
-                self.rssm.flat_stoch,
-                shapes,
-            )
-            # Coarse decoder for reconstruction-based coarse rep loss.
             self.coarse_decoder = networks.MultiDecoder(
                 config.decoder,
                 self.rssm._context_size,
                 self.rssm.flat_stoch,
                 shapes,
             )
+            modules["coarse_decoder"] = self.coarse_decoder
         elif self.rep_loss in ("r2dreamer", "infonce"):
-            # Rebuild projector with new feat_size.
-            self.prj = Projector(self.rssm.feat_size, self.embed_size)
-            # Coarse projector for Barlow/InfoNCE coarse rep loss.
             self.coarse_prj = Projector(self.rssm.coarse_feat_size, self.embed_size)
-        elif self.rep_loss == "dreamerpro":
-            # Rebuild feat_proj with new feat_size.
-            self.feat_proj = nn.Linear(self.rssm.feat_size, self.proto_dim)
+            modules["coarse_projector"] = self.coarse_prj
 
-        # --- Optional coarse critic ---
         if self.use_coarse_critic:
             self.coarse_value = networks.MLPHead(config.critic, self.rssm.coarse_feat_size)
             self._slow_coarse_value = copy.deepcopy(self.coarse_value)
             for param in self._slow_coarse_value.parameters():
                 param.requires_grad = False
-
-        # --- Rebuild optimizer with all parameters ---
-        modules = {
-            "rssm": self.rssm,
-            "actor": self.actor,
-            "value": self.value,
-            "reward": self.reward,
-            "cont": self.cont,
-            "encoder": self.encoder,
-        }
-        if self.rep_loss == "dreamer":
-            modules["decoder"] = self.decoder
-            modules["coarse_decoder"] = self.coarse_decoder
-        elif self.rep_loss in ("r2dreamer", "infonce"):
-            modules["projector"] = self.prj
-            modules["coarse_projector"] = self.coarse_prj
-        elif self.rep_loss == "dreamerpro":
-            modules.update({
-                "prototypes": self._prototypes,
-                "obs_proj": self.obs_proj,
-                "feat_proj": self.feat_proj,
-                "ema_encoder": self._ema_encoder,
-                "ema_obs_proj": self._ema_obs_proj,
-            })
-        if self.use_coarse_critic:
             modules["coarse_value"] = self.coarse_value
 
-        for key, module in modules.items():
-            if isinstance(module, nn.Parameter):
-                print(f"{module.numel():>14,}: {key}")
-            else:
-                print(f"{sum(p.numel() for p in module.parameters()):>14,}: {key}")
-
-        self._named_params = OrderedDict()
-        for name, module in modules.items():
-            if isinstance(module, nn.Parameter):
-                self._named_params[name] = module
-            else:
-                for param_name, param in module.named_parameters():
-                    self._named_params[f"{name}.{param_name}"] = param
-        print(f"Optimizer has: {sum(p.numel() for p in self._named_params.values())} parameters.")
-
-        # Rebuild optimizer with new params.
-        from optim import LaProp
-        self._optimizer = LaProp(
-            self._named_params.values(),
-            lr=config.lr,
-            betas=(config.beta1, config.beta2),
-            eps=config.eps,
-        )
-        from torch.optim.lr_scheduler import LambdaLR
-
-        def lr_lambda(step):
-            if config.warmup:
-                return min(1.0, (step + 1) / config.warmup)
-            return 1.0
-
-        self._scheduler = LambdaLR(self._optimizer, lr_lambda=lr_lambda)
-
-        self.train()
-        self.clone_and_freeze()
-        if orig_compile:
-            print("Compiling update function with torch.compile...")
-            self._cal_grad = torch.compile(self._cal_grad, mode="reduce-overhead")
+        return modules
 
     # ------------------------------------------------------------------
     # Overrides
@@ -165,7 +71,7 @@ class ThickDreamer(Dreamer):
 
     def train(self, mode=True):
         super().train(mode)
-        if self.use_coarse_critic and hasattr(self, "_slow_coarse_value"):
+        if getattr(self, "use_coarse_critic", False) and hasattr(self, "_slow_coarse_value"):
             self._slow_coarse_value.train(False)
         return self
 
@@ -239,14 +145,12 @@ class ThickDreamer(Dreamer):
         if self.rep_loss == "dreamerpro":
             self.ema_update()
         metrics = {}
-        from torch.amp import autocast, GradScaler
         with autocast(device_type=self.device.type, dtype=torch.float16):
             (stoch, deter, context), mets = self._cal_grad(p_data, initial)
         self._scaler.unscale_(self._optimizer)
         if self.rep_loss == "dreamerpro" and self._ema_updates < self.freeze_prototypes_iters:
             self._prototypes.grad.zero_()
         if self._log_grads:
-            import tools
             old_params = [p.data.clone().detach() for p in self._named_params.values()]
             grads = [p.grad for p in self._named_params.values() if p.grad is not None]
             grad_norm = tools.compute_global_norm(grads)
@@ -281,7 +185,6 @@ class ThickDreamer(Dreamer):
         losses on top of the standard Dreamer losses.  Optionally adds
         a coarse critic with mixed value targets.
         """
-        import tools
 
         losses = {}
         metrics = {}

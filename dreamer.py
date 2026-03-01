@@ -34,11 +34,7 @@ class Dreamer(nn.Module):
         shapes = {k: tuple(v.shape) for k, v in obs_space.spaces.items()}
         self.encoder = networks.MultiEncoder(config.encoder, shapes)
         self.embed_size = self.encoder.out_dim
-        self.rssm = rssm.RSSM(
-            config.rssm,
-            self.embed_size,
-            self.act_dim,
-        )
+        self.rssm = self._make_rssm(config, self.embed_size, self.act_dim)
         self.reward = networks.MLPHead(config.reward, self.rssm.feat_size)
         self.cont = networks.MLPHead(config.cont, self.rssm.feat_size)
 
@@ -122,12 +118,29 @@ class Dreamer(nn.Module):
                 "ema_encoder": self._ema_encoder,
                 "ema_obs_proj": self._ema_obs_proj,
             })
-        # count number of parameters in each module
+
+        # Hook for subclasses to add extra modules (e.g. THICK).
+        modules = self._extend_modules(config, obs_space, act_space, shapes, modules)
+
+        self._build_optimizer(config, modules)
+
+    def _make_rssm(self, config, embed_size, act_dim):
+        """Create the RSSM. Override in subclasses to use a different model (e.g. CRSSM)."""
+        return rssm.RSSM(config.rssm, embed_size, act_dim)
+
+    def _extend_modules(self, config, obs_space, act_space, shapes, modules):
+        """Hook for subclasses to add extra modules before optimizer is built.
+        Returns the (possibly augmented) modules dict."""
+        return modules
+
+    def _build_optimizer(self, config, modules):
+        """Build optimizer, scheduler, and finalize model setup."""
         for key, module in modules.items():
             if isinstance(module, nn.Parameter):
                 print(f"{module.numel():>14,}: {key}")
             else:
                 print(f"{sum(p.numel() for p in module.parameters()):>14,}: {key}")
+
         self._named_params = OrderedDict()
         for name, module in modules.items():
             if isinstance(module, nn.Parameter):
