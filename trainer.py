@@ -195,7 +195,15 @@ class OnlineTrainer:
         agent_state = agent.get_initial_state(envs.env_num)
         # (B, A)
         act = agent_state["prev_action"].clone()
+        _last_mem_step = 0
         while step < self.steps:
+            if step - _last_mem_step >= 50000:
+                import gc; gc.collect(); torch.cuda.empty_cache()
+                alloc = torch.cuda.memory_allocated() / 1e9
+                res = torch.cuda.memory_reserved() / 1e9
+                maxalloc = torch.cuda.max_memory_allocated() / 1e9
+                print(f"[MEM step={step}] alloc={alloc:.2f}GB reserved={res:.2f}GB max_alloc={maxalloc:.2f}GB")
+                _last_mem_step = step
             # Evaluation
             if self._should_eval(step) and self.eval_episode_num > 0:
                 self.eval(agent, step)
