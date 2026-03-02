@@ -47,7 +47,7 @@ else
 fi
 
 TIMESTAMP=$(date +%m%d_%H%M%S)
-RUN_NAME="${VARIANT}_memorymaze_s${SEED}_${TIMESTAMP}"
+RUN_NAME="memorymaze_${VARIANT}_s${SEED}_${TIMESTAMP}"
 
 THICK_FLAGS=""
 if [ "$THICK" = "true" ]; then
@@ -57,7 +57,8 @@ if [ "$THICK" = "true" ]; then
     fi
 fi
 
-export MUJOCO_GL=osmesa
+export MUJOCO_GL=egl
+export MUJOCO_EGL_DEVICE_ID=$GPU
 CUDA_VISIBLE_DEVICES=$GPU nohup python -u train.py \
     env=memorymaze \
     env.task=memorymaze_9x9 \

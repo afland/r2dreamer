@@ -47,7 +47,7 @@ else
 fi
 
 TIMESTAMP=$(date +%m%d_%H%M%S)
-RUN_NAME="${VARIANT}_pong_s${SEED}_${TIMESTAMP}"
+RUN_NAME="pong_${VARIANT}_s${SEED}_${TIMESTAMP}"
 
 THICK_FLAGS=""
 if [ "$THICK" = "true" ]; then
