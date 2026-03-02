@@ -522,9 +522,10 @@ class Dreamer(nn.Module):
             metrics["gate_frac"] = gate_open.mean()
             # Fraction of timesteps where *any* gate unit fires (B, T)
             metrics["gate_step_frac"] = gate_open.max(dim=-1).values.mean()
-            # Mean magnitude of non-zero gates
-            gate_nonzero = gates[gates > 0]
-            metrics["gate_magnitude"] = gate_nonzero.mean() if gate_nonzero.numel() > 0 else torch.tensor(0.0)
+            # Mean magnitude of non-zero gates (fixed-shape to avoid torch.compile recompilation)
+            gate_sum = (gates * gate_open).sum()
+            gate_count = gate_open.sum()
+            metrics["gate_magnitude"] = gate_sum / gate_count.clamp(min=1)
             # Context change: L2 norm of consecutive differences, averaged
             ctx_diff = post_context[:, 1:] - post_context[:, :-1]
             metrics["context_change_norm"] = ctx_diff.norm(dim=-1).mean()
