@@ -60,7 +60,7 @@ fi
 CUDA_VISIBLE_DEVICES=$GPU nohup python -u train.py \
     env=atari100k \
     env.task=atari_pong \
-    model=size50M \
+    model=size12M \
     model.rep_loss=${REP_LOSS} \
     model.compile=True \
     buffer.storage_device=cpu \

@@ -57,10 +57,11 @@ if [ "$THICK" = "true" ]; then
     fi
 fi
 
+export MUJOCO_GL=osmesa
 CUDA_VISIBLE_DEVICES=$GPU nohup python -u train.py \
     env=memorymaze \
     env.task=memorymaze_9x9 \
-    model=size50M \
+    model=size12M \
     model.rep_loss=${REP_LOSS} \
     model.compile=True \
     buffer.storage_device=cpu \
