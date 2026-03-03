@@ -54,6 +54,7 @@ class OnlineTrainer:
         agent_state = agent.get_initial_state(envs.env_num)
         # (B, A)
         act = agent_state["prev_action"].clone()
+        env0_started = False
         env0_done = False
         while not once_done.all():
             steps += ~done * ~once_done
@@ -88,8 +89,10 @@ class OnlineTrainer:
                     if key not in log_metrics:
                         log_metrics[key] = torch.zeros_like(returns)
                     log_metrics[key] += value[:, 0] * ~once_done
-            if done[0]:
+            # Track env 0 done, but skip the initial reset-done signal
+            if env0_started and done[0]:
                 env0_done = True
+            env0_started = True
             once_done |= done
         # dict of (B, T, *)
         cache = torch.stack(cache, dim=1) if len(cache) else None
