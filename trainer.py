@@ -1,3 +1,5 @@
+import pathlib
+
 import numpy as np
 import torch
 
@@ -24,6 +26,9 @@ class OnlineTrainer:
         self._should_log = tools.Every(config.update_log_every)
         self._should_eval = tools.Every(self.eval_every)
         self._action_repeat = config.action_repeat
+        # Video saving to disk every 100k steps
+        self._should_save_video = tools.Every(1e5)
+        self._video_dir = pathlib.Path(logdir) / "videos"
 
     def eval(self, agent, train_step):
         """Run evaluation episodes.
@@ -33,6 +38,7 @@ class OnlineTrainer:
         (H2D with non_blocking=True) right before policy inference.
         """
         print("Evaluating the policy...")
+        save_video = self._should_save_video(train_step)
         envs = self.eval_envs
         agent.eval()
         # (B,)
@@ -44,9 +50,11 @@ class OnlineTrainer:
         # cache is only used for video logging / open-loop prediction.
         cache = []
         context_cache = []  # collect context vectors for overlay
+        video_frames = []  # full episode frames for disk video (env 0 only)
         agent_state = agent.get_initial_state(envs.env_num)
         # (B, A)
         act = agent_state["prev_action"].clone()
+        env0_done = False
         while not once_done.all():
             steps += ~done * ~once_done
             # Step environments on CPU.
@@ -66,6 +74,9 @@ class OnlineTrainer:
             trans["action"] = act
             if len(cache) < self.batch_length:
                 cache.append(trans.clone())
+            # Collect full episode frames for env 0 (for disk video saving)
+            if save_video and not env0_done and "image" in trans:
+                video_frames.append(tools.to_np(trans["image"][0, 0]))  # (H, W, C)
             # (B, A)
             act, agent_state = agent.act(trans, agent_state, eval=True)
             # Collect context/gate for video overlay (env 0 only)
@@ -77,6 +88,8 @@ class OnlineTrainer:
                     if key not in log_metrics:
                         log_metrics[key] = torch.zeros_like(returns)
                     log_metrics[key] += value[:, 0] * ~once_done
+            if done[0]:
+                env0_done = True
             once_done |= done
         # dict of (B, T, *)
         cache = torch.stack(cache, dim=1) if len(cache) else None
@@ -91,6 +104,17 @@ class OnlineTrainer:
             if len(context_cache) > 0:
                 video = self._overlay_context(video, context_cache)
             self.logger.video("eval_video", video)
+        # Save full eval episode video to disk every 100k steps
+        if save_video and len(video_frames) > 0:
+            full_video = np.stack(video_frames, axis=0)[None]  # (1, T, H, W, C)
+            if len(context_cache) > 0:
+                full_video = self._overlay_context(full_video, context_cache)
+            frames = full_video[0]  # (T, H, W, C)
+            if np.issubdtype(frames.dtype, np.floating):
+                frames = np.clip(255 * frames, 0, 255).astype(np.uint8)
+            path = self._video_dir / f"step_{train_step:09d}.mp4"
+            tools.save_video(path, frames, fps=16)
+            print(f"Saved eval video: {path}")
         if self.video_pred_log and cache is not None:
             initial = agent.get_initial_state(1)
             if "context" in initial.keys():

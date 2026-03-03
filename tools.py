@@ -115,6 +115,30 @@ class CudaBenchmark:
         print(self._comment, self._st.elapsed_time(self._nd) / 1000)
 
 
+def save_video(path, frames, fps=16):
+    """Save a numpy video array to an mp4 file.
+
+    Args:
+        path: Output file path (should end in .mp4).
+        frames: (T, H, W, C) uint8 numpy array.
+        fps: Frames per second.
+    """
+    import imageio
+
+    path = str(path)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    # libx264 requires even width and height
+    T, H, W, C = frames.shape
+    pad_h = H % 2
+    pad_w = W % 2
+    if pad_h or pad_w:
+        frames = np.pad(frames, ((0, 0), (0, pad_h), (0, pad_w), (0, 0)), mode="edge")
+    writer = imageio.get_writer(path, fps=fps, macro_block_size=1)
+    for t in range(frames.shape[0]):
+        writer.append_data(frames[t])
+    writer.close()
+
+
 class Logger:
     def __init__(self, logdir, filename="metrics.jsonl"):
         self._logdir = logdir
