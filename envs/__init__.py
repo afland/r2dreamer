@@ -50,6 +50,16 @@ def make_env(config, id):
 
         env = crafter.Crafter(task, config.size, seed=config.seed + id)
         env = wrappers.OneHotAction(env)
+    elif suite == "pinpad":
+        from envs.pinpad import PinPad
+
+        env = PinPad(task, length=config.time_limit, seed=config.seed + id)
+        env = wrappers.OneHotAction(env)
+    elif suite == "minigrid":
+        from envs.minigrid import MiniGrid
+
+        env = MiniGrid(task, config.size, seed=config.seed + id)
+        env = wrappers.OneHotAction(env)
     elif suite == "metaworld":
         import envs.metaworld as metaworld
 
