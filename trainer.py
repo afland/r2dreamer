@@ -76,11 +76,14 @@ class OnlineTrainer:
             if len(cache) < self.batch_length:
                 cache.append(trans.clone())
             # Collect full episode frames for env 0 (for disk video saving)
-            if save_video and not env0_done and "image" in trans:
-                img = trans["image"][0]  # (1, H, W, C) or (H, W, C)
-                if img.ndim == 4:
-                    img = img[0]
-                video_frames.append(tools.to_np(img))  # (H, W, C)
+            # Prefer display_image (includes HUD not shown to agent) over image.
+            if save_video and not env0_done:
+                vid_key = "display_image" if "display_image" in trans.keys() else "image"
+                if vid_key in trans.keys():
+                    img = trans[vid_key][0]  # (1, H, W, C) or (H, W, C)
+                    if img.ndim == 4:
+                        img = img[0]
+                    video_frames.append(tools.to_np(img))  # (H, W, C)
             # (B, A)
             act, agent_state = agent.act(trans, agent_state, eval=True)
             # Collect context/gate for video overlay (env 0 only)
@@ -282,6 +285,9 @@ class OnlineTrainer:
             trans["episode"] = episode_ids  # Don't lift dim
             if "image" in trans:
                 video_cache.append(trans["image"][0])
+            # Drop display-only keys before storing in replay buffer.
+            if "display_image" in trans.keys():
+                del trans["display_image"]
             self.replay_buffer.add_transition(trans.detach())
             returns += trans["reward"][:, 0]
             # Update models after enough data has accumulated

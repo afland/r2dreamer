@@ -78,7 +78,8 @@ class PinPad(gym.Env):
         self.steps += 1
         self.done = self.done or (self.steps >= self.length)
         obs = {
-            "image": self._render(),
+            "image": self._render_obs(),
+            "display_image": self._render_display(),
             "is_first": False,
             "is_last": self.done,
             "is_terminal": False,
@@ -92,13 +93,15 @@ class PinPad(gym.Env):
         self.done = False
         self.countdown = 0
         return {
-            "image": self._render(),
+            "image": self._render_obs(),
+            "display_image": self._render_display(),
             "is_first": True,
             "is_last": False,
             "is_terminal": False,
         }
 
-    def _render(self):
+    def _render_grid(self):
+        """Render the base 16x16 grid without progress bar."""
         grid = np.zeros((16, 16, 3), np.uint8) + 255
         white = np.array([255, 255, 255])
         if self.countdown:
@@ -112,14 +115,37 @@ class PinPad(gym.Env):
                 color = color if char == current else (10 * color + 90 * white) / 100
                 grid[x, y] = color
         grid[self.player] = (0, 0, 0)
+        # Fill bar area with wall color (agent never sees progress)
         grid[:, -2:] = (192, 192, 192)
-        for i, char in enumerate(self.sequence):
-            grid[2 * i + 1, -2] = self.COLORS[char]
+        return grid
+
+    def _render_obs(self):
+        """Agent observation: 64x64, no progress bar."""
+        grid = self._render_grid()
         image = np.repeat(np.repeat(grid, 4, 0), 4, 1)
         return image.transpose((1, 0, 2))
 
+    def _render_display(self):
+        """Display image for videos: agent view + red separator + progress bar.
+
+        Returns (64, 76, 3) uint8 — wider than the agent's observation to make
+        it obvious the progress strip is not part of the agent's input.
+        """
+        grid = self._render_grid()
+        # Build progress bar strip (16x2)
+        bar = np.full((16, 2, 3), 48, dtype=np.uint8)  # dark background
+        for i, char in enumerate(self.sequence):
+            bar[2 * i + 1, 0] = self.COLORS[char]
+        # Separator column (16x1) in red
+        sep = np.full((16, 1, 3), 0, dtype=np.uint8)
+        sep[..., 0] = 255  # red
+        # Concatenate: grid (16x16) | sep (16x1) | bar (16x2)
+        combined = np.concatenate([grid, sep, bar], axis=1)  # (16, 19, 3)
+        image = np.repeat(np.repeat(combined, 4, 0), 4, 1)  # (64, 76, 3)
+        return image.transpose((1, 0, 2))
+
     def render(self):
-        return self._render()
+        return self._render_display()
 
 
 LAYOUT_THREE = """
