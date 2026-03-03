@@ -109,6 +109,7 @@ class OnlineTrainer:
             self.logger.video("eval_video", video)
         # Save full eval episode video to disk every 100k steps
         if save_video and len(video_frames) > 0:
+            print(f"Saving video: {len(video_frames)} frames, frame shape: {video_frames[0].shape}")
             full_video = np.stack(video_frames, axis=0)[None]  # (1, T, H, W, C)
             if len(context_cache) > 0:
                 full_video = self._overlay_context(full_video, context_cache)

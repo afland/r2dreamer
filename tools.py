@@ -120,13 +120,15 @@ def save_video(path, frames, fps=16):
 
     Args:
         path: Output file path (should end in .mp4).
-        frames: (T, H, W, C) uint8 numpy array.
+        frames: (T, H, W, C) or (H, W, C) uint8 numpy array.
         fps: Frames per second.
     """
     import imageio
 
     path = str(path)
     os.makedirs(os.path.dirname(path), exist_ok=True)
+    if frames.ndim == 3:
+        frames = frames[None]  # (H, W, C) -> (1, H, W, C)
     # libx264 requires even width and height
     T, H, W, C = frames.shape
     pad_h = H % 2
