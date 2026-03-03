@@ -77,7 +77,10 @@ class OnlineTrainer:
                 cache.append(trans.clone())
             # Collect full episode frames for env 0 (for disk video saving)
             if save_video and not env0_done and "image" in trans:
-                video_frames.append(tools.to_np(trans["image"][0, 0]))  # (H, W, C)
+                img = trans["image"][0]  # (1, H, W, C) or (H, W, C)
+                if img.ndim == 4:
+                    img = img[0]
+                video_frames.append(tools.to_np(img))  # (H, W, C)
             # (B, A)
             act, agent_state = agent.act(trans, agent_state, eval=True)
             # Collect context/gate for video overlay (env 0 only)
